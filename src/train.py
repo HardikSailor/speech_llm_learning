@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from .collate import SpeechCollator
 from .config import DataConfig, ModelConfig
 from .data import SpeechTextDataset
+from .device import autocast, describe, move_batch, pick_device, resolve_precision
 from .modeling import SpeechLLM
 from .sampler import LengthBucketBatchSampler, padding_waste
 
@@ -40,19 +41,23 @@ def lr_lambda(step: int, total: int, warmup: int) -> float:
 
 # ----------------------------------------------------------------- evaluation
 @torch.no_grad()
-def evaluate(model, loader, max_batches: int = 8, decode_batches: int = 1):
+def evaluate(model, loader, max_batches: int = 8, decode_batches: int = 1,
+             device: torch.device = torch.device("cpu"), precision: str = "fp32"):
     model.eval()
     tot_loss, tot_tok, refs, hyps = 0.0, 0, [], []
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        loss, _ = model(batch["mel"], batch["mel_lengths"], batch["segments"])
+        batch = move_batch(batch, device)
+        with autocast(device, precision):
+            loss, _ = model(batch["mel"], batch["mel_lengths"], batch["segments"])
+            if i < decode_batches:
+                hyps += model.generate(batch["mel"], batch["mel_lengths"], batch["segments"],
+                                       max_new_tokens=100)
         n = sum(len(s.ans_ids) for s in batch["segments"])
         tot_loss += loss.item() * n
         tot_tok += n
         if i < decode_batches:
-            hyps += model.generate(batch["mel"], batch["mel_lengths"], batch["segments"],
-                                   max_new_tokens=100)
             refs += batch["texts"]
     model.train()
     val_loss = tot_loss / max(1, tot_tok)
@@ -66,6 +71,33 @@ def evaluate(model, loader, max_batches: int = 8, decode_batches: int = 1):
             pass
     return {"loss": val_loss, "ppl": math.exp(min(20, val_loss)), "wer": wer,
             "refs": refs, "hyps": hyps}
+
+
+# ----------------------------------------------------------------- tensorboard
+def make_writer(logdir: Path, enabled: bool):
+    """A SummaryWriter, or None if disabled / tensorboard is not installed.
+
+    Every `tb.add_*` call below is guarded by `if tb:` so the loop runs identically without it.
+    View with:  tensorboard --logdir runs/  (then ssh -L 6006:localhost:6006 <login node>)
+    """
+    if not enabled:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("tensorboard not installed - skipping TB logging")
+        return None
+    return SummaryWriter(log_dir=str(logdir))
+
+
+def log_eval(tb, m: dict, step: int, prefix: str = "val") -> None:
+    tb.add_scalar(f"{prefix}/loss", m["loss"], step)
+    tb.add_scalar(f"{prefix}/ppl", m["ppl"], step)
+    if not math.isnan(m["wer"]):
+        tb.add_scalar(f"{prefix}/wer", m["wer"], step)
+    # Markdown table in the TEXT tab: watch the hypotheses go from babble to transcripts.
+    rows = "\n".join(f"| {r[:120]} | {h[:120]} |" for r, h in zip(m["refs"][:4], m["hyps"][:4]))
+    tb.add_text(f"{prefix}/samples", "| ref | hyp |\n|---|---|\n" + rows, step)
 
 
 # ----------------------------------------------------------------- main
@@ -90,11 +122,22 @@ def main() -> None:
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/stage5")
+    ap.add_argument("--no-tensorboard", action="store_true", help="disable TB logging")
+    ap.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:1 | mps")
+    ap.add_argument("--precision", default="auto", choices=["auto", "fp32", "bf16"],
+                    help="auto = bf16 autocast on a bf16-capable GPU, else fp32")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    device = pick_device(args.device)
+    precision = resolve_precision(args.precision, device)
+    if device.type == "cuda":
+        # TF32 for any matmul left in fp32 (Ampere+): 10-bit mantissa, ~free speedup.
+        torch.set_float32_matmul_precision("high")
+    print(f"device: {describe(device)}   precision: {precision}")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    tb = make_writer(out / "tb", enabled=not args.no_tensorboard)
 
     # ---- data ---------------------------------------------------------------
     dcfg = DataConfig(root=args.root, max_seconds=args.max_seconds)
@@ -105,14 +148,16 @@ def main() -> None:
 
     mcfg = ModelConfig(projector=args.projector, stack_k=args.stack_k,
                        max_audio_seconds=args.max_seconds)
-    model = SpeechLLM(mcfg)
+    model = SpeechLLM(mcfg).to(device)
     coll = SpeechCollator(model.tokenizer, mcfg)
 
     sampler = LengthBucketBatchSampler(train_ds.durations, args.batch_size, seed=args.seed)
+    pin = device.type == "cuda"
     train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=coll,
-                              num_workers=args.num_workers)
+                              num_workers=args.num_workers, pin_memory=pin,
+                              persistent_workers=args.num_workers > 0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=coll,
-                            num_workers=0, shuffle=False)
+                            num_workers=0, shuffle=False, pin_memory=pin)
 
     naive = [list(range(i, min(i + args.batch_size, len(train_ds))))
              for i in range(0, len(train_ds), args.batch_size)]
@@ -144,16 +189,24 @@ def main() -> None:
     model.encoder.eval()
     model.llm.eval()
 
+    if tb:
+        tb.add_text("config", "\n".join(f"    {k}: {v}" for k, v in vars(args).items()), 0)
+        tb.add_text("model", "    " + model.trainable_report().replace("\n", "\n    "), 0)
+
     hist, step, micro, t0, seen_audio = [], 0, 0, time.time(), 0.0
+    accum_loss = 0.0     # mean loss over the micro-batches of one optimizer step
     done = False
     for epoch in range(args.epochs):
         if done:
             break
         sampler.set_epoch(epoch)
         for batch in train_loader:
-            loss, _ = model(batch["mel"], batch["mel_lengths"], batch["segments"])
+            batch = move_batch(batch, device)
+            with autocast(device, precision):
+                loss, _ = model(batch["mel"], batch["mel_lengths"], batch["segments"])
             # Scale by 1/accum so that N micro-batches sum to the mean loss of one big batch.
             (loss / args.grad_accum).backward()
+            accum_loss += loss.item() / args.grad_accum
             seen_audio += batch["mel_lengths"].sum().item() / 100
             micro += 1
             if micro % args.grad_accum:
@@ -165,15 +218,29 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
             step += 1
 
+            if tb:
+                # Every optimizer step: TB smooths the curve itself, so no need to subsample.
+                el = time.time() - t0
+                tb.add_scalar("train/loss", accum_loss, step)
+                tb.add_scalar("train/lr", sched.get_last_lr()[0], step)
+                tb.add_scalar("train/grad_norm", float(gnorm), step)
+                tb.add_scalar("train/realtime_factor", seen_audio / el, step)
+                tb.add_scalar("train/audio_minutes_seen", seen_audio / 60, step)
+                tb.add_scalar("train/epoch", epoch, step)
+            step_loss, accum_loss = accum_loss, 0.0
+
             if step % args.log_every == 0 or step == 1:
                 el = time.time() - t0
-                print(f"step {step:4d}/{total_steps}  loss {loss.item():7.4f}  "
+                print(f"step {step:4d}/{total_steps}  loss {step_loss:7.4f}  "
                       f"lr {sched.get_last_lr()[0]:.2e}  |g| {gnorm:6.3f}  "
                       f"{seen_audio/el:5.1f}x realtime  {el:5.0f}s")
-                hist.append({"step": step, "loss": loss.item(),
+                hist.append({"step": step, "loss": step_loss,
                              "lr": sched.get_last_lr()[0], "gnorm": float(gnorm)})
             if step % args.eval_every == 0 or step == total_steps:
-                m = evaluate(model, val_loader)
+                m = evaluate(model, val_loader, device=device, precision=precision)
+                if tb:
+                    log_eval(tb, m, step)
+                    tb.flush()
                 print(f"  [eval] val_loss {m['loss']:.4f}  ppl {m['ppl']:.1f}  "
                       f"WER {m['wer']*100:.1f} %")
                 for r, h in zip(m["refs"][:2], m["hyps"][:2]):
@@ -186,12 +253,21 @@ def main() -> None:
     # ---- checkpoint ---------------------------------------------------------
     # Save ONLY what we trained. The encoder and the LLM are byte-identical to the hub
     # weights, so storing them again would waste 145M x 4 bytes per checkpoint.
-    torch.save({"projector": model.projector.state_dict(),
+    # .cpu() so the checkpoint loads on a machine without a GPU.
+    torch.save({"projector": {k: v.cpu() for k, v in model.projector.state_dict().items()},
                 "model_config": vars(mcfg)}, out / "projector.pt")
     (out / "history.json").write_text(json.dumps(hist, indent=2))
-    m = evaluate(model, val_loader, max_batches=8, decode_batches=2)
+    m = evaluate(model, val_loader, max_batches=8, decode_batches=2,
+                 device=device, precision=precision)
     (out / "final_eval.json").write_text(json.dumps(
         {k: v for k, v in m.items() if k in ("loss", "ppl", "wer")}, indent=2))
+    if tb:
+        log_eval(tb, m, step, prefix="final")
+        # HPARAMS tab: compare runs (e.g. projector / minutes / lr) against final WER.
+        hp = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
+        tb.add_hparams(hp, {"hparam/final_wer": m["wer"], "hparam/final_val_loss": m["loss"]},
+                       run_name=".")
+        tb.close()
     print(f"\nsaved {out/'projector.pt'}  "
           f"({(out/'projector.pt').stat().st_size/1e6:.1f} MB)")
     print(f"final: val_loss {m['loss']:.4f}  WER {m['wer']*100:.1f} %")

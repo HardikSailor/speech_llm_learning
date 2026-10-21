@@ -108,7 +108,7 @@ def main() -> None:
 
     # ---- 3. the prompt layout ------------------------------------------------
     pb = PromptBuilder(tok)
-    seg = pb.build("Transcribe the audio into English text.", answer="hello world")
+    seg = pb.build("Transcribe the audio into text.", answer="hello world")
     print("prompt segments (audio embeddings get spliced between pre and post):")
     print(seg.describe(tok))
 

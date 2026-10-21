@@ -1,0 +1,37 @@
+#!/bin/bash
+#PBS -N speechllm_stage5
+#PBS -l select=1:ngpus=1:ncpus=14:mem=235GB
+#PBS -l walltime=01:00:00
+#PBS -q R212478
+#PBS -P 13003558_R4
+#PBS -j oe
+#PBS -o /scratch/users/astar/ares/sailorhb/git_repos/speech_llm_learning/runs/pbs_logs/
+#
+# Stage 5 on one GPU. Same hyper-parameters as scripts/train_stage5.sh, so the CPU and GPU
+# runs are directly comparable in TensorBoard.
+#   qsub scripts/train_gpu.pbs
+#   qsub -v MINUTES=120,EPOCHS=4 scripts/train_gpu.pbs
+#
+# Python: the speechllm venv is torch+cpu, so this uses the align env (torch 2.14.1+cu130,
+# transformers 4.57.6) plus a --no-deps overlay holding jiwer + tensorboard.
+set -euo pipefail
+cd /scratch/users/astar/ares/sailorhb/git_repos/speech_llm_learning
+source scripts/env.sh
+export PY=/scratch/users/astar/ares/sailorhb/container/envs/align/bin/python
+export PYTHONPATH=/scratch/users/astar/ares/sailorhb/envs/speechllm_gpu_pydeps
+export HF_HUB_OFFLINE=1          # whisper-tiny + SmolLM2 are already in $HF_HOME
+export OMP_NUM_THREADS=8
+
+MINUTES=${MINUTES:-30}; EPOCHS=${EPOCHS:-6}
+echo "job ${PBS_JOBID:-none} on $(hostname) start $(date)"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+$PY -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('torch', torch.__version__, torch.cuda.get_device_name())"
+
+$PY -m src.train \
+    --root "$LIBRISPEECH/dev-clean" \
+    --minutes "$MINUTES" --epochs "$EPOCHS" \
+    --batch-size 8 --grad-accum 2 --lr 1e-3 \
+    --num-workers 8 --log-every 10 --eval-every 40 \
+    --device cuda --precision "${PRECISION:-auto}" \
+    --out "runs/stage5_${MINUTES}min_gpu"
+echo "done $(date)"
